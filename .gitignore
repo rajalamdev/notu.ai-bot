@@ -13,5 +13,9 @@ screenshots/
 /playwright/.cache/
 /playwright/.auth/
 
-.chrome-profile
-.github
+.chrome-profile/
+.github/
+.chrome-profile/*
+.chrome-profile/*/* 
+
+
