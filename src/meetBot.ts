@@ -10,6 +10,7 @@ import { chromium, BrowserContext, Page } from 'playwright';
 import { EventEmitter } from 'events';
 import path from 'path';
 import fs from 'fs';
+import axios from 'axios';
 import config from './config';
 import { BotSession, BotStatus, Segment } from './types';
 
@@ -27,7 +28,9 @@ export class MeetBot extends EventEmitter {
     private session: BotSession;
     private segments: Segment[] = [];
     private isLeaving = false;
+    private cleanupDone = false;  // Prevent double cleanup
     private flushInterval: NodeJS.Timeout | null = null;
+    private audioChunkIndex = 0;
     private timeoutTimer: NodeJS.Timeout | null = null;
     private messageHandler: ((msg: ExtensionMessage) => void) | null = null;
 
@@ -53,6 +56,25 @@ export class MeetBot extends EventEmitter {
             ...this.session,
             segments: this.segments,
         };
+    }
+
+    /**
+     * Handle incoming audio chunk from extension
+     */
+    private async handleAudioChunk(data: any): Promise<void> {
+        try {
+            // console.log(`[MeetBot] 🎵 Received audio chunk ${this.audioChunkIndex} (${data.duration}s)`);
+
+            // Send to backend
+            await axios.post(`${config.backendUrl}/api/meetings/${this.session.meetingId}/audio-chunk`, {
+                audioData: data.audioData, // Base64 string
+                timestamp: data.timestamp,
+                duration: data.duration,
+                index: this.audioChunkIndex++,
+            });
+        } catch (error: any) {
+            console.error(`[MeetBot] ❌ Failed to upload audio chunk: ${error.message}`);
+        }
     }
 
     /**
@@ -108,16 +130,44 @@ export class MeetBot extends EventEmitter {
                     '--window-size=1400,900',
                     '--window-position=0,0',
                 ],
-                viewport: { width: 1366, height: 768 },
+                viewport: { width: 1366, height: 600 },
                 locale: 'en-US',
                 timezoneId: 'America/New_York',
                 permissions: ['microphone', 'camera'],
                 userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+
+                // Video recording disabled
+                // recordVideo: { ... },
+            });
+
+            // Handle manual browser close
+            this.context.on('close', async () => {
+                console.log('[MeetBot] ⚠️ Browser context closed externally');
+                // Only trigger if NOT already leaving/completed
+                if (!this.isLeaving && !this.cleanupDone) {
+                    await this.handleMeetingEnd();
+                }
             });
 
             // Get existing page or create new one
             const pages = this.context.pages();
             this.page = pages.length > 0 ? pages[0] : await this.context.newPage();
+
+            // BRIDGE: Expose function to receive audio chunks from browser
+            await this.page.exposeFunction('submitAudioChunk', async (data: any) => {
+                await this.handleAudioChunk(data);
+            });
+
+            // BRIDGE: Inject script to relay window messages to exposed function
+            await this.page.addInitScript(() => {
+                window.addEventListener('message', (event) => {
+                    // Only accept messages from our extension
+                    if (event.data && event.data.source === 'notu-bot-extension' && event.data.type === 'audio_chunk') {
+                        // @ts-ignore
+                        window.submitAudioChunk(event.data);
+                    }
+                });
+            });
 
             // Enable console logging for debugging
             if (config.debug) {
@@ -217,11 +267,12 @@ export class MeetBot extends EventEmitter {
             this.setStatus('failed', 'Could not join meeting');
         }
 
-        // Caption parsing: look for [Caption] format
+        // Caption parsing: look for [Caption] format (may have emoji prefix)
         const captionMatch = text.match(/\[Caption\]\s*(.+?):\s*(.+)/);
         if (captionMatch) {
             const speaker = captionMatch[1].trim();
             const captionText = captionMatch[2].trim();
+            console.log(`[MeetBot] 📝 Parsed caption - ${speaker}: ${captionText.substring(0, 50)}...`);
             this.handleCaption({
                 speaker,
                 text: captionText,
@@ -244,6 +295,13 @@ export class MeetBot extends EventEmitter {
             ? (Date.now() - this.session.startedAt.getTime()) / 1000
             : 0;
 
+        // Final flush of segments
+        this.flushSegments();
+
+        // Update session data
+        this.session.completedAt = new Date();
+        this.session.segments = this.segments;
+
         // EMIT COMPLETED EVENT with all segments - this triggers SessionManager.finalizeMeeting()
         console.log(`[MeetBot] Emitting completed event with ${this.segments.length} segments`);
         this.emit('completed', {
@@ -253,7 +311,11 @@ export class MeetBot extends EventEmitter {
             duration: duration,
         });
 
-        await this.leave('meeting_ended');
+        // Cleanup resources (don't call leave() - that would double-cleanup)
+        await this.cleanup();
+
+        // Set final status
+        this.setStatus('completed');
     }
 
     /**
@@ -423,6 +485,12 @@ export class MeetBot extends EventEmitter {
      * Leave meeting and cleanup
      */
     async leave(reason = 'user_requested'): Promise<BotSession> {
+        if (this.isLeaving) {
+            console.log('[MeetBot] Already leaving, skipping');
+            return this.getSession();
+        }
+        this.isLeaving = true;
+
         console.log(`[MeetBot] Leaving meeting: ${reason}`);
         this.setStatus('leaving');
 
@@ -443,11 +511,26 @@ export class MeetBot extends EventEmitter {
         // Final flush
         this.flushSegments();
 
-        // Cleanup
-        await this.cleanup();
+        // Calculate duration
+        const duration = this.session.startedAt
+            ? (Date.now() - this.session.startedAt.getTime()) / 1000
+            : 0;
 
         this.session.completedAt = new Date();
         this.session.segments = this.segments;
+
+        // EMIT COMPLETED EVENT - SessionManager listens to this for finalization
+        console.log(`[MeetBot] Emitting completed event with ${this.segments.length} segments (reason: ${reason})`);
+        this.emit('completed', {
+            meetingId: this.session.meetingId,
+            reason: reason,
+            segments: this.segments,
+            duration: duration,
+        });
+
+        // Cleanup
+        await this.cleanup();
+
         this.setStatus('completed');
 
         return this.getSession();
@@ -457,6 +540,13 @@ export class MeetBot extends EventEmitter {
      * Cleanup resources
      */
     private async cleanup(): Promise<void> {
+        // Prevent double cleanup
+        if (this.cleanupDone) {
+            console.log('[MeetBot] Cleanup already done, skipping');
+            return;
+        }
+        this.cleanupDone = true;
+
         if (this.flushInterval) {
             clearInterval(this.flushInterval);
             this.flushInterval = null;

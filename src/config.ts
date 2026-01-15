@@ -6,7 +6,8 @@ dotenv.config();
 export const config: BotConfig = {
     port: parseInt(process.env.PORT || '3001', 10),
     backendUrl: process.env.BACKEND_URL || 'http://localhost:4000',
-    backendWsUrl: process.env.BACKEND_WS_URL || 'ws://localhost:4000',
+    // Socket.IO uses HTTP for handshake, then upgrades to WebSocket
+    backendWsUrl: process.env.BACKEND_WS_URL || process.env.BACKEND_URL || 'http://localhost:4000',
     botName: process.env.BOT_NAME || 'Notu.AI Bot',
     maxDurationMinutes: parseInt(process.env.MAX_MEETING_DURATION_MINUTES || '120', 10),
     flushIntervalMs: parseInt(process.env.FLUSH_INTERVAL_MS || '30000', 10),

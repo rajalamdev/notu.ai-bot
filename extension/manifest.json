@@ -1,11 +1,12 @@
 {
     "manifest_version": 3,
     "name": "Notu.AI Meet Bot",
-    "version": "1.0.0",
-    "description": "Chrome extension for Notu.AI meeting transcription bot",
+    "version": "1.1.0",
+    "description": "Chrome extension for Notu.AI meeting transcription bot with audio capture",
     "permissions": [
         "activeTab",
-        "storage"
+        "storage",
+        "tabCapture"
     ],
     "host_permissions": [
         "https://meet.google.com/*"
@@ -16,6 +17,7 @@
                 "https://meet.google.com/*"
             ],
             "js": [
+                "audioCapture.js",
                 "content.js"
             ],
             "run_at": "document_idle"

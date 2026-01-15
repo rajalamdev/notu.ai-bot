@@ -14,6 +14,7 @@ import { BotSession, BotStatus, Segment } from './types';
 export class BotSessionManager extends EventEmitter {
     private sessions: Map<string, MeetBot> = new Map();
     private socket: Socket | null = null;
+    private finalizedMeetings: Set<string> = new Set(); // Prevent duplicate finalization
 
     constructor() {
         super();
@@ -25,21 +26,26 @@ export class BotSessionManager extends EventEmitter {
      */
     private connectToBackend(): void {
         try {
+            console.log(`[SessionManager] Connecting to backend at ${config.backendWsUrl}...`);
             this.socket = io(config.backendWsUrl, {
-                transports: ['websocket'],
+                transports: ['websocket', 'polling'], // Allow polling fallback
                 reconnection: true,
                 reconnectionAttempts: 10,
                 reconnectionDelay: 1000,
             });
 
             this.socket.on('connect', () => {
-                console.log('[SessionManager] Connected to backend WebSocket');
+                console.log('[SessionManager] ✅ Connected to backend WebSocket');
                 // Register as bot service
                 this.socket?.emit('bot_service_connected', { service: 'meet-bot' });
             });
 
-            this.socket.on('disconnect', () => {
-                console.log('[SessionManager] Disconnected from backend WebSocket');
+            this.socket.on('disconnect', (reason) => {
+                console.log(`[SessionManager] ❌ Disconnected from backend: ${reason}`);
+            });
+
+            this.socket.on('connect_error', (error) => {
+                console.error('[SessionManager] 🔴 Connection error:', error.message);
             });
 
             this.socket.on('error', (error) => {
@@ -76,15 +82,12 @@ export class BotSessionManager extends EventEmitter {
         bot.on('caption', (data) => {
             console.log(`[SessionManager] 📝 Caption from meeting ${meetingId}: ${data.segment?.text?.substring(0, 40)}...`);
 
-            // Emit via WebSocket for real-time (if connected)
+            // Emit via WebSocket for real-time only
+            // (batch segments are sent via HTTP on flush to avoid duplicates)
             this.emitToBackend('caption_added', {
                 meetingId: data.meetingId,
                 segment: data.segment,
             });
-
-            // ALSO send HTTP POST to update database immediately
-            // This ensures frontend polling gets the caption
-            this.sendCaptionToBackend(meetingId, data.segment);
         });
 
         bot.on('flush', (data) => {
@@ -107,6 +110,13 @@ export class BotSessionManager extends EventEmitter {
                 ...bot.getSession(),
                 segments: data.segments,
                 completedAt: new Date(),
+            });
+
+            // Emit final status update
+            this.emitToBackend('bot_status_change', {
+                meetingId,
+                status: 'completed',
+                message: 'Meeting completed successfully',
             });
 
             // Clean up session
@@ -134,19 +144,19 @@ export class BotSessionManager extends EventEmitter {
             return null;
         }
 
+        // leave() triggers handleMeetingEnd() which emits 'completed' event
+        // The 'completed' event handler (line 95+) will handle finalization
+        // So we don't call finalizeMeeting() here to avoid double finalization
         const session = await bot.leave(reason);
-        this.sessions.delete(meetingId);
 
-        // Notify backend
+        // Notify backend that user requested stop
         this.emitToBackend('bot_meeting_ended', {
             meetingId,
             session,
             reason,
         });
 
-        // Send final segments
-        await this.finalizeMeeting(meetingId, session);
-
+        // Note: session cleanup is done by 'completed' event handler
         return session;
     }
 
@@ -171,6 +181,8 @@ export class BotSessionManager extends EventEmitter {
     private emitToBackend(event: string, data: any): void {
         if (this.socket?.connected) {
             this.socket.emit(event, data);
+        } else {
+            console.warn(`[SessionManager] ⚠️ Socket not connected, cannot emit ${event}`);
         }
     }
 
@@ -205,6 +217,13 @@ export class BotSessionManager extends EventEmitter {
      * Finalize meeting on backend
      */
     private async finalizeMeeting(meetingId: string, session: BotSession): Promise<void> {
+        // Prevent duplicate finalization
+        if (this.finalizedMeetings.has(meetingId)) {
+            console.log(`[SessionManager] Meeting ${meetingId} already finalized, skipping`);
+            return;
+        }
+        this.finalizedMeetings.add(meetingId);
+
         try {
             await axios.post(`${config.backendUrl}/api/bot/${meetingId}/finalize`, {
                 sessionId: session.sessionId,
@@ -216,6 +235,8 @@ export class BotSessionManager extends EventEmitter {
             console.log(`[SessionManager] Finalized meeting ${meetingId}`);
         } catch (error: any) {
             console.error('[SessionManager] Failed to finalize meeting:', error.message);
+            // Remove from set so retry is possible
+            this.finalizedMeetings.delete(meetingId);
         }
     }
 
